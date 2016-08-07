@@ -30,6 +30,7 @@ my $PREFIX = shift;
 
 #PIPELINE
 #Step 1: Open old BAM file,read in header with samtools, and load arrays
+print STDERR "Opening old BAM file, reading in headers.\n";
 open OLDBAM, "$dirname/samtools view -H $OLDBAM |" or die("Could not open <$OLDBAM>.\n"); 
 while(my $line = <OLDBAM>) {
 	chomp($line);
@@ -49,7 +50,7 @@ if(scalar @readgroups <1) {
 
 
 #Step 2: Create temp files for each Readgroup and pump RG reads from realigned BAM into each file
-
+print STDERR "Creating temp files for each readgroup.\n";
 mkdir "tmp"; #creates temporary directory "tmp" in the current working directory
 #fill the @tmpbam and @tmpsam array with the filenames for the temporary bams and sams
 for(my $i=0; $i<scalar(@readgroups); $i++) {
@@ -58,7 +59,7 @@ for(my $i=0; $i<scalar(@readgroups); $i++) {
 	my $tmpsam_name = "tmp/$PREFIX.$flowcells[$i].$lanes[$i].tmp.sam";
 	push @tmpsams, $tmpsam_name; 
 }
-
+print STDERR "Loading headers into temporary SAM files.\n";
 #create the temporary SAM files and load the header into each of them
 #note the header needs the @RGs from OLDBAM and the rest of the header from REBAM
 open OLDBAM, "$dirname/samtools view -H $OLDBAM |" or die("Could not open <$OLDBAM>.\n");
@@ -84,33 +85,85 @@ while(my $line = <REBAM>) {
 		}
 	}
 }
+close(REBAM);
 #compress those header-containing sam files into bam files
+print STDERR "Generating temporary readgroup BAM files.\n";
 for(my $i=0; $i<scalar(@tmpsams); $i++) {
 	system("$dirname/samtools view -Sb $tmpsams[$i] > $tmpbams[$i]");
-#	system("rm -r $tmpsams[$i]");
+	system("$dirname/samtools index $tmpbams[$i]");
 }
 
-=cut
 #load the actual reads from $REBAM into the correct readgroup tmpbams
+print STDERR "Loading actual reads from realigned BAM into the temp readgroup BAMs.\n";
 open REBAM, "$dirname/samtools view $REBAM |" or die("Could not open <$REBAM>.\n");
+my $counter=0;
+print STDERR "Now on line:\n";
+print STDERR "$counter";
 while(my $line = <REBAM>) {
+	$counter++;
+	print STDERR "\r$counter";
 	chomp($line);
 	for(my $i=0; $i<scalar(@readgroups); $i++) {
-		if($line =~ m/(^\w+):(\w+):/)
+		if($line =~ m/(^\w+):(\w+):/) {
 			my $line_rg = $1;
 			my $line_lane = $2;
-			if($line_rg eq $readgroups[$i] && $line_lane eq $lanes[$i]) {
-				open(TMPBAM, ">>$tmpbam") or die ("Could not write to <$tmpbam>.\n");
-				print TMPBAM "$line\n";
-				close(TMPBAM);
+			if($line_rg eq $flowcells[$i] && $line_lane eq $lanes[$i]) {
+				#creating a temporary one-read BAM file to feed into samtools cat
+				my $tmpsam_rg = "tmp/$PREFIX.$flowcells[$i].$lanes[$i].tmp.rg.sam"; 
+				open(TMPSAMRG, ">>$tmpsam_rg") or die ("Could not write to <$tmpsam_rg>.\n");
+				open(TMPSAM, $tmpsams[$i]) or die("Could not read to <$tmpsams[$i]>.\n");
+				while(my $samline = <TMPSAM>) {
+					chomp($samline);
+					print TMPSAMRG "$samline\n";
+				}
+				print TMPSAMRG "$line\n";
+				close(TMPSAM);
+				close(TMPSAMRG);
+				my $tmpbam_rg = "tmp/$PREFIX.$flowcells[$i].$lanes[$i].tmp.rg.bam";
+				system("$dirname/samtools view -Sb $tmpsam_rg > $tmpbam_rg");
+				system("$dirname/samtools index $tmpbam_rg");
+
+				#cat the one read onto the end of the BAM file
+				my $tmpbam_cat = "tmp/$PREFIX.$flowcells[$i].$lanes[$i].tmp.rg.cat.bam";
+				system("$dirname/samtools cat $tmpbams[$i] $tmpbam_rg > $tmpbam_cat");
+				system("mv $tmpbam_cat $tmpbams[$i]");
+				system("$dirname/samtools index $tmpbams[$i]");
+
+				#clean up tmp files for this segment
+				system("rm -r $tmpbam_rg*");
+				system("rm -r $tmpsam_rg*");
 			}
 		}
 	}
 }
-=cut
+close(REBAM);
+print STDERR "\n";
+print STDERR "Finished!\n";
 
-#Step 3: Use Picard to add RGs to each file based on RGs in original BAM's header
+#Step 3: Use Picard to fix RGs to each file based on RGs in original BAM's header
+print STDERR "Fixing the RGs in each RG BAM file.\n";
+my @tmpbam_replacedrg;
+for(my $i=0; $i<scalar(@readgroups); $i++) {
+	my $tmpbam_name = "tmp/$PREFIX.$flowcells[$i].$lanes[$i].tmp.replacedrg.bam";
+	push @tmpbam_replacedrg, $tmpbam_name;
+	my @rg_line = split(/\s+/, $readgroups[$i]);
+	my $RGID = $rg_line[1];
+	my $RGPL = $rg_line[2];
+	my $RGPU = $rg_line[3];
+	my $RGLB = $rg_line[4];
+	my $RGPI = $rg_line[5];
+	my $RGSM = $rg_line[6];
+	my $picardcmd = "java -Xmx$RAM -jar $dirname/picard.jar I=$tmpbams[$i] O=$tmpbam_name SO=coordinate RGID=$RGID RGPL=$RGPL RGPU=$RGPU RGLB=$RGLB RGPI=$RGPI RGSM=$RGSM";
+	system("$picardcmd");
+	system("$dirname/samtools index $tmpbam_name");
+}
 
 #Step 4: Merge temp BAM files into output BAM file
+print STDERR "Merge the temporary RG BAM files into the final BAM file.\n";
+my $mergedbam_cmd = "java -Xmx$RAM -jar $dirname/picard.jar SO=coordinate O=$PREFIX.rgfixed.bam";
+for(my $i=0; $i<scalar(@tmpbam_replacedrg); $i++) {
+	$mergedbam_cmd = $mergedbam_cmd . " I=$tmpbam_replacedrg[$i]";
+}
+system("$mergedbam_cmd");
 
 #Step 5: Clean up
